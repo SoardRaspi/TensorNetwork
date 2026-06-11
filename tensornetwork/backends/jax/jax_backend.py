@@ -99,6 +99,118 @@ class JaxBackend(abstract_backend.AbstractBackend):
             relative=relative,
         )
 
+    def svd_multi_strat(
+      self,
+      tensor: Tensor,
+      pivot_axis: int = -1,
+      max_singular_values: Optional[int] = None,
+      max_truncation_error: Optional[float] = None,
+      relative: Optional[bool] = False,
+      truncation_mode: Optional[str] = 'highest',
+  ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+      
+      left_dims = tensor.shape[:pivot_axis]
+      right_dims = tensor.shape[pivot_axis:]
+
+      tensor = jnp.reshape(tensor, [np.prod(left_dims), np.prod(right_dims)])
+      u, s, vh = jnp.linalg.svd(tensor, full_matrices=False)
+
+      if max_singular_values is None:
+          # max_singular_values = jnp.size(s)
+          max_singular_values = s.shape[0]
+
+      if max_truncation_error is not None:
+          trunc_errs = jnp.sqrt(jnp.cumsum(jnp.square(s[::-1])))
+          if relative:
+              abs_max_truncation_error = max_truncation_error * s[0]
+          else:
+              abs_max_truncation_error = max_truncation_error
+          num_sing_vals_err = jnp.count_nonzero(
+              (trunc_errs > abs_max_truncation_error).astype(np.int32)
+          )
+      else:
+          num_sing_vals_err = max_singular_values
+
+      k = min(max_singular_values, num_sing_vals_err)
+      # total = jnp.size(s)
+      total = s.shape[0]
+      k = min(k, total)
+
+      # ── index selection based on truncation mode ──────────────────────────
+      if truncation_mode == 'highest':
+          # keep_idx = numpy.arange(num_sing_vals_keep)
+          u_k = jax.lax.slice_in_dim(u, 0, k, axis=1)
+          s_k = jax.lax.slice_in_dim(s, 0, k, axis=0)
+          vh_k = jax.lax.slice_in_dim(vh, 0, k, axis=0)
+
+      elif truncation_mode == 'lowest':
+          # keep_idx = numpy.arange(max(0, total - num_sing_vals_keep), total)
+          u_k = jax.lax.slice_in_dim(u, total - k, total, axis=1)
+          s_k = jax.lax.slice_in_dim(s, total - k, total, axis=0)
+          vh_k = jax.lax.slice_in_dim(vh, total - k, total, axis=0)
+
+      elif truncation_mode == 'middle':
+          # mid = total // 2
+          # half = num_sing_vals_keep // 2
+          # start = max(0, mid - half)
+          # end = min(total, start + num_sing_vals_keep)
+          # keep_idx = numpy.arange(start, end)
+
+          mid = total // 2
+          half = k // 2
+          u_k = jax.lax.slice_in_dim(u, mid - half, mid - half + k, axis=1)
+          s_k = jax.lax.slice_in_dim(s, mid - half, mid - half + k, axis=0)
+          vh_k = jax.lax.slice_in_dim(vh, mid - half, mid - half + k, axis=0)
+
+      elif truncation_mode == 'both':
+          # half = num_sing_vals_keep // 2
+          # top_idx = numpy.arange(half)
+          # bottom_idx = numpy.arange(max(0, total - half), total)
+          # keep_idx = numpy.concatenate([top_idx, bottom_idx])
+          # keep_idx = numpy.sort(keep_idx)[:num_sing_vals_keep]
+
+          half = k // 2
+          u_k = jnp.concatenate([jax.lax.slice_in_dim(u, 0, half, axis=1),
+                                 jax.lax.slice_in_dim(u, total-half, total, axis=1)], axis=1)
+          s_k = jnp.concatenate([jax.lax.slice_in_dim(s, 0, half, axis=0),
+                                 jax.lax.slice_in_dim(s, total-half, total, axis=0)])
+          vh_k = jnp.concatenate([jax.lax.slice_in_dim(vh, 0, half, axis=0),
+                                  jax.lax.slice_in_dim(vh, total-half, total, axis=0)], axis=0)
+
+      else:
+          raise ValueError(f"Unknown truncation_mode: {truncation_mode}. "
+                          f"Choose from highest, lowest, middle, both.")
+
+      # rest_idx = numpy.setdiff1d(numpy.arange(total), keep_idx)
+      # # ─────────────────────────────────────────────────────────────────────
+
+      # s = s.astype(tensor.dtype)
+
+      # s_rest = s[rest_idx]
+      # s = s[keep_idx]
+      # u = u[:, keep_idx]
+      # vh = vh[keep_idx, :]
+
+      # dim_s = s.shape[0]
+      # u = np.reshape(u, list(left_dims) + [dim_s])
+      # vh = np.reshape(vh, [dim_s] + list(right_dims))
+
+      # return u, s, vh, s_rest
+
+      pad = max_singular_values - k
+
+      u_k = jnp.concatenate([u_k, jnp.zeros((u_k.shape[0], pad), u_k.dtype)], axis=1)
+      s_k = jnp.concatenate([s_k, jnp.zeros((pad,), s_k.dtype)])
+      vh_k = jnp.concatenate([vh_k, jnp.zeros((pad, vh_k.shape[1]), vh_k.dtype)], axis=0)
+
+      s_rest = jax.lax.slice_in_dim(s, k, total, axis=0)
+
+      dim_s = s_k.shape[0]
+      u_k = jnp.reshape(u_k, list(left_dims)  + [dim_s])
+      vh_k = jnp.reshape(vh_k, [dim_s] + list(right_dims))
+
+      return u_k, s_k, vh_k, s_rest
+
     def qr(
         self, tensor: Tensor, pivot_axis: int = -1, non_negative_diagonal: bool = False
     ) -> Tuple[Tensor, Tensor]:
